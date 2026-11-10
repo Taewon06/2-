@@ -1,0 +1,334 @@
+`timescale 1ns/1ps
+
+module combo2_dac #(
+    parameter integer CLK_HZ = 50_000_000,
+    parameter SEG_ACTIVE_LOW = 1'b0,
+    parameter DIGIT_ACTIVE_LOW = 1'b1
+)(
+    input wire clk, rst, add_sel, key_debug,
+    input wire seg_flip, digit_flip,
+    input wire [5:0] btn,
+    output wire dac_csn, dac_ldacn,
+    output reg dac_wrn, dac_a_b,
+    output reg [7:0] dac_d,
+    output wire [7:0] led_out,
+    output wire [7:0] seg, digit,
+    output wire [7:0] lcd_d,
+    output wire lcd_rs, lcd_rw, lcd_e
+);
+    localparam [1:0] DELAY = 2'b00, SET_WRN = 2'b01, UP_DATA = 2'b10;
+    localparam integer KEY_IDLE_CYCLES = CLK_HZ / 1000;
+    localparam integer DIP_STABLE_CYCLES = CLK_HZ / 200;
+    localparam integer KEY_COUNT_BITS = $clog2(KEY_IDLE_CYCLES + 1);
+    localparam integer DIP_COUNT_BITS = $clog2(DIP_STABLE_CYCLES + 1);
+
+    // SW2 asserts reset high. Its release is synchronized to clk.
+    (* ASYNC_REG = "TRUE" *) reg [1:0] reset_release;
+    always @(posedge clk or posedge rst) begin
+        if (rst) reset_release <= 0;
+        else reset_release <= {reset_release[0], 1'b1};
+    end
+    wire rst_n = reset_release[1];
+
+    (* ASYNC_REG = "TRUE" *) reg [5:0] btn_meta, btn_sync;
+    (* ASYNC_REG = "TRUE" *) reg sel_meta, sel_sync, dip_meta, dip_sync;
+    reg [5:0] btn_idle, btn_previous, seen_keys;
+    reg [6:0] startup_count;
+    reg ready, key_armed;
+    reg [KEY_COUNT_BITS-1:0] idle_count;
+    reg [DIP_COUNT_BITS-1:0] dip_count;
+    reg dip_stable;
+    wire [5:0] pressed = btn_sync ^ btn_idle;
+    wire accept_key = ready && key_armed && pressed != 0 &&
+                      pressed == btn_previous;
+    wire dip_step = ready && dip_sync != dip_stable &&
+                    dip_count == DIP_STABLE_CYCLES - 1;
+
+    reg [1:0] state;
+    reg [7:0] cnt, dac_d_temp, written_code;
+    assign dac_csn = 1'b0;
+    assign dac_ldacn = 1'b0;
+
+    // SW3 high shows all key inputs observed since reset.
+    // SW3 low shows the current 8-bit DAC code.
+    assign led_out = rst ? 8'h55 :
+                     dip_stable ? {2'b00, seen_keys} : dac_d_temp;
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            btn_meta <= 0;
+            btn_sync <= 0;
+            btn_idle <= 0;
+            btn_previous <= 0;
+            seen_keys <= 0;
+            startup_count <= 0;
+            ready <= 0;
+            key_armed <= 0;
+            idle_count <= 0;
+            sel_meta <= 0;
+            sel_sync <= 0;
+            dip_meta <= 0;
+            dip_sync <= 0;
+            dip_stable <= 0;
+            dip_count <= 0;
+        end else begin
+            btn_meta <= btn;
+            btn_sync <= btn_meta;
+            sel_meta <= add_sel;
+            sel_sync <= sel_meta;
+            dip_meta <= key_debug;
+            dip_sync <= dip_meta;
+            if (!ready) begin
+                // Leave the keypad released while the idle level is sampled.
+                if (&startup_count) begin
+                    btn_idle <= btn_sync;
+                    dip_stable <= dip_sync;
+                    ready <= 1;
+                    key_armed <= 1;
+                end else
+                    startup_count <= startup_count + 1'b1;
+            end else begin
+                btn_previous <= pressed;
+                seen_keys <= seen_keys | pressed;
+                if (accept_key)
+                    key_armed <= 0;
+                if (pressed != 0)
+                    idle_count <= 0;
+                else if (!key_armed) begin
+                    if (idle_count == KEY_IDLE_CYCLES - 1) begin
+                        key_armed <= 1;
+                        idle_count <= 0;
+                    end else
+                        idle_count <= idle_count + 1'b1;
+                end
+
+                if (dip_sync == dip_stable)
+                    dip_count <= 0;
+                else if (dip_step) begin
+                    dip_stable <= dip_sync;
+                    dip_count <= 0;
+                end else
+                    dip_count <= dip_count + 1'b1;
+            end
+        end
+    end
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
+            dac_d_temp <= 0;
+        else if (dip_step)
+            dac_d_temp <= dac_d_temp + 8'd8;
+        else if (accept_key) begin
+            case (pressed) // SM1, SM3, SM4, SM6, SM7, SM9
+                6'b100000: dac_d_temp <= dac_d_temp - 8'd1;
+                6'b010000: dac_d_temp <= dac_d_temp + 8'd1;
+                6'b001000: dac_d_temp <= dac_d_temp - 8'd2;
+                6'b000100: dac_d_temp <= dac_d_temp + 8'd2;
+                6'b000010: dac_d_temp <= dac_d_temp - 8'd8;
+                6'b000001: dac_d_temp <= dac_d_temp + 8'd8;
+                default: ;
+            endcase
+        end
+    end
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            state <= DELAY;
+            cnt <= 0;
+            dac_wrn <= 1;
+            dac_a_b <= 0;
+            dac_d <= 0;
+            written_code <= 0;
+        end else begin
+            cnt <= cnt + 1'b1;
+            case (state)
+                DELAY: begin
+                    dac_wrn <= 1;
+                    if (!dac_wrn) written_code <= dac_d;
+                    if (cnt == 10) dac_a_b <= sel_sync;
+                    if (cnt == 200) begin
+                        cnt <= 0;
+                        state <= SET_WRN;
+                    end
+                end
+                SET_WRN: begin
+                    dac_wrn <= 0;
+                    if (cnt == 50) begin
+                        cnt <= 0;
+                        state <= UP_DATA;
+                    end
+                end
+                UP_DATA: begin
+                    if (cnt == 0) dac_d <= dac_d_temp;
+                    if (cnt == 30) begin
+                        cnt <= 0;
+                        state <= DELAY;
+                    end
+                end
+                default: begin
+                    cnt <= 0;
+                    state <= DELAY;
+                end
+            endcase
+        end
+    end
+
+    // Main DIP switches 5 and 6 select the output polarities.
+    wire [7:0] seg_base, digit_base;
+    assign seg = seg_base ^ {8{seg_flip}};
+    assign digit = digit_base ^ {8{digit_flip}};
+
+    dac_display #(
+        .CLK_HZ(CLK_HZ),
+        .SEG_ACTIVE_LOW(SEG_ACTIVE_LOW),
+        .DIGIT_ACTIVE_LOW(DIGIT_ACTIVE_LOW)
+    ) display (
+        .clk(clk), .rst_n(rst_n), .code(written_code),
+        .seg(seg_base), .digit(digit_base), .lcd_d(lcd_d),
+        .lcd_rs(lcd_rs), .lcd_rw(lcd_rw), .lcd_e(lcd_e)
+    );
+endmodule
+module dac_display #(
+    parameter integer CLK_HZ = 50_000_000,
+    parameter SEG_ACTIVE_LOW = 1'b0,
+    parameter DIGIT_ACTIVE_LOW = 1'b1
+) (
+    input wire clk, rst_n,
+    input wire [7:0] code,
+    output wire [7:0] seg, digit,
+    output reg [7:0] lcd_d,
+    output reg lcd_rs, lcd_e,
+    output wire lcd_rw
+);
+    // Decimal digits, each truncated to four bits.
+    wire [3:0] hundreds = code / 8'd100;
+    wire [3:0] tens = (code % 8'd100) / 8'd10;
+    wire [3:0] ones = code % 8'd10;
+    localparam integer SCAN_CYCLES = CLK_HZ / 1000;
+    localparam integer TICKS_US = (CLK_HZ + 999_999) / 1_000_000;
+    integer scan_counter;
+    reg [1:0] scan_index;
+    reg [7:0] digit_on;
+    reg [3:0] current_digit;
+    reg [6:0] segment_on;
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            scan_counter <= 0;
+            scan_index <= 0;
+        end else if (scan_counter == SCAN_CYCLES - 1) begin
+            scan_counter <= 0;
+            scan_index <= (scan_index == 2) ? 0 : scan_index + 1'b1;
+        end else scan_counter <= scan_counter + 1;
+    end
+
+    always @* begin
+        case (scan_index)
+            0: begin digit_on = 8'h20; current_digit = hundreds; end
+            1: begin digit_on = 8'h40; current_digit = tens; end
+            default: begin digit_on = 8'h80; current_digit = ones; end
+        endcase
+        case (current_digit) // Bits 0 through 6 are a through g.
+            0: segment_on = 7'h3f;
+            1: segment_on = 7'h06;
+            2: segment_on = 7'h5b;
+            3: segment_on = 7'h4f;
+            4: segment_on = 7'h66;
+            5: segment_on = 7'h6d;
+            6: segment_on = 7'h7d;
+            7: segment_on = 7'h07;
+            8: segment_on = 7'h7f;
+            9: segment_on = 7'h6f;
+            default: segment_on = 0;
+        endcase
+    end
+
+    assign seg = {1'b0, segment_on} ^ {8{SEG_ACTIVE_LOW}};
+    assign digit = digit_on ^ {8{DIGIT_ACTIVE_LOW}};
+    assign lcd_rw = 1'b0;
+
+    localparam [2:0] LOAD = 0, E_HIGH = 1, E_LOW = 2, NEXT_BYTE = 3, READY = 4;
+    reg [2:0] lcd_state;
+    reg [3:0] lcd_index;
+    reg [7:0] previous_code;
+    reg [3:0] lcd_hundreds, lcd_tens, lcd_ones;
+    integer lcd_timer, command_delay;
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            lcd_state <= LOAD;
+            lcd_timer <= 50_000 * TICKS_US;
+            command_delay <= 60 * TICKS_US;
+            lcd_index <= 0;
+            lcd_rs <= 0;
+            lcd_e <= 0;
+            lcd_d <= 0;
+            previous_code <= 0;
+            lcd_hundreds <= 0;
+            lcd_tens <= 0;
+            lcd_ones <= 0;
+        end else if (lcd_timer != 0) begin
+            lcd_timer <= lcd_timer - 1;
+        end else begin
+            case (lcd_state)
+                LOAD: begin
+                    lcd_rs <= (lcd_index >= 9);
+                    command_delay <= 60 * TICKS_US;
+                    case (lcd_index)
+                        0: begin lcd_d <= 8'h30; command_delay <= 5_000 * TICKS_US; end
+                        1, 2: begin lcd_d <= 8'h30; command_delay <= 200 * TICKS_US; end
+                        3: lcd_d <= 8'h38;
+                        4: lcd_d <= 8'h08;
+                        5: begin lcd_d <= 8'h01; command_delay <= 3_000 * TICKS_US; end
+                        6: lcd_d <= 8'h06;
+                        7: lcd_d <= 8'h0c;
+                        8: lcd_d <= 8'h80;
+                        9: lcd_d <= "D";
+                        10: lcd_d <= "A";
+                        11: lcd_d <= "C";
+                        12: lcd_d <= " ";
+                        13: lcd_d <= 8'h30 + lcd_hundreds;
+                        14: lcd_d <= 8'h30 + lcd_tens;
+                        15: lcd_d <= 8'h30 + lcd_ones;
+                    endcase
+                    lcd_timer <= TICKS_US;
+                    lcd_state <= E_HIGH;
+                end
+                E_HIGH: begin
+                    lcd_e <= 1;
+                    lcd_timer <= TICKS_US;
+                    lcd_state <= E_LOW;
+                end
+                E_LOW: begin
+                    lcd_e <= 0;
+                    lcd_timer <= command_delay;
+                    lcd_state <= NEXT_BYTE;
+                end
+                NEXT_BYTE: begin
+                    if (lcd_index == 15) lcd_state <= READY;
+                    else begin
+                        lcd_index <= lcd_index + 1'b1;
+                        lcd_state <= LOAD;
+                        if (lcd_index == 7) begin
+                            previous_code <= code;
+                            lcd_hundreds <= hundreds;
+                            lcd_tens <= tens;
+                            lcd_ones <= ones;
+                        end
+                    end
+                end
+                READY: begin
+                    if (code != previous_code) begin
+                        previous_code <= code;
+                        lcd_hundreds <= hundreds;
+                        lcd_tens <= tens;
+                        lcd_ones <= ones;
+                        lcd_index <= 8;
+                        lcd_state <= LOAD;
+                    end
+                end
+                default: lcd_state <= READY;
+            endcase
+        end
+    end
+endmodule
